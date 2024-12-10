@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import hashlib
+import pyinotify
 
 # Setup logging
 logging.basicConfig(
@@ -222,8 +223,12 @@ X-AppImage-LastUpdate={int(time.time())}
 
 def clean_desktop_files():
     """Remove .desktop files for AppImages that no longer exist."""
+    logging.info("Starting cleanup of desktop files...")
+    removed_count = 0
+    
     # Clean up both desktop dir and desktop shortcuts
     for location in [DESKTOP_DIR, DESKTOP_SHORTCUTS_DIR]:
+        logging.info(f"Checking directory: {location}")
         for desktop_file in location.glob("*.desktop"):
             try:
                 with open(desktop_file) as f:
@@ -233,12 +238,106 @@ def clean_desktop_files():
                         for line in content.splitlines():
                             if line.startswith("X-AppImage-Path="):
                                 appimage_path = Path(line.split("=", 1)[1].strip())
-                                if not appimage_path.exists() or WATCH_DIR.as_posix() in content:
+                                if not appimage_path.exists():
+                                    logging.info(f"Removing desktop file for missing AppImage: {appimage_path}")
+                                    logging.info(f"Deleting: {desktop_file}")
                                     desktop_file.unlink()
-                                    logging.info(f"Removed obsolete .desktop file: {desktop_file}")
-                                break
+                                    removed_count += 1
+                                    break
             except (IOError, OSError) as e:
                 logging.error(f"Error cleaning up desktop file {desktop_file}: {e}")
+    
+    logging.info(f"Cleanup complete. Removed {removed_count} desktop files.")
+
+def monitor_appimages():
+    """Monitor the directory for AppImage changes using inotify."""
+    class EventHandler(pyinotify.ProcessEvent):
+        def process_default(self, event):
+            """Only log specific events we care about"""
+            if any(x in event.maskname for x in ['IN_CREATE', 'IN_DELETE', 'IN_MODIFY', 'IN_MOVED']):
+                logging.debug(f"Received event: {event.maskname} for {event.pathname}")
+
+        def process_IN_CREATE(self, event):
+            if event.pathname.endswith('.AppImage'):
+                path = Path(event.pathname)
+                logging.debug(f"CREATE event detected: {event.pathname}")
+                logging.info(f"New AppImage detected: {path}")
+                create_desktop_file(path)
+
+        def process_IN_DELETE(self, event):
+            if event.pathname.endswith('.AppImage'):
+                path = Path(event.pathname)
+                logging.debug(f"DELETE event detected: {event.pathname}")
+                logging.info(f"AppImage removed: {path}")
+                logging.info("Initiating desktop file cleanup...")
+                clean_desktop_files()
+                logging.info("Desktop file cleanup completed")
+
+        def process_IN_MODIFY(self, event):
+            if event.pathname.endswith('.AppImage'):
+                path = Path(event.pathname)
+                desktop_file = DESKTOP_DIR / f"{path.stem}.desktop"
+                if needs_update(path, desktop_file):
+                    logging.debug(f"MODIFY event detected: {event.pathname}")
+                    logging.info(f"AppImage modified: {path}")
+                    create_desktop_file(path)
+
+        def process_IN_MOVED_FROM(self, event):
+            if event.pathname.endswith('.AppImage'):
+                path = Path(event.pathname)
+                logging.debug(f"MOVED_FROM event detected: {event.pathname}")
+                logging.info(f"AppImage moved/renamed from: {path}")
+                clean_desktop_files()
+
+        def process_IN_MOVED_TO(self, event):
+            if event.pathname.endswith('.AppImage'):
+                path = Path(event.pathname)
+                logging.debug(f"MOVED_TO event detected: {event.pathname}")
+                logging.info(f"AppImage moved/renamed to: {path}")
+                create_desktop_file(path)
+
+    try:
+        # Initialize inotify
+        wm = pyinotify.WatchManager()
+        handler = EventHandler()
+        notifier = pyinotify.Notifier(wm, handler)
+
+        # Add watch with necessary events
+        mask = (pyinotify.IN_CREATE | 
+                pyinotify.IN_DELETE | 
+                pyinotify.IN_MODIFY | 
+                pyinotify.IN_MOVED_FROM | 
+                pyinotify.IN_MOVED_TO | 
+                pyinotify.IN_DELETE_SELF |
+                pyinotify.IN_MOVE_SELF)
+        
+        watch_path = str(WATCH_DIR)
+        logging.info(f"Setting up watch on {watch_path}")
+        
+        # Add the watch and check the result
+        watch_id = wm.add_watch(watch_path, mask)
+        if watch_path not in watch_id or watch_id[watch_path] < 0:
+            logging.error(f"Failed to add watch for {watch_path}: {watch_id}")
+            sys.exit(1)
+
+        # Process existing AppImages first
+        logging.info("Processing existing AppImages...")
+        for appimage in WATCH_DIR.glob("*.AppImage"):
+            desktop_file = DESKTOP_DIR / f"{appimage.stem}.desktop"
+            if needs_update(appimage, desktop_file):
+                create_desktop_file(appimage)
+
+        # Clean up any stale desktop files
+        logging.info("Performing initial cleanup...")
+        clean_desktop_files()
+
+        logging.info(f"Starting inotify watch loop on {WATCH_DIR}")
+        notifier.loop()
+
+    except Exception as e:
+        logging.error(f"Error in monitor loop: {str(e)}")
+        logging.error(f"Error details:", exc_info=True)
+        sys.exit(1)
 
 def get_appimage_metadata(appimage_path):
     """Get metadata for an AppImage including modification time and hash."""
@@ -286,94 +385,151 @@ def needs_update(appimage_path, desktop_file_path):
         logging.error(f"Error checking update status for {appimage_path}: {e}")
         return True
 
-def monitor_appimages():
-    """Continuously monitor the directory for AppImage changes."""
-    previous_files = set()
-    processed_files = {}  # Keep track of processed files and their metadata
-    
-    while True:
-        try:
-            WATCH_DIR.mkdir(parents=True, exist_ok=True)
-            DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
-            ICON_DIR.mkdir(parents=True, exist_ok=True)
+def debug_systemd_service():
+    """Debug systemd service status and configuration."""
+    try:
+        # Check if systemd is running
+        systemd_status = subprocess.run(
+            ["systemctl", "--user", "status"],
+            capture_output=True, text=True
+        )
+        logging.info("Systemd user service status:")
+        logging.info(systemd_status.stdout)
 
-            current_files = {f for f in WATCH_DIR.iterdir() if f.suffix == ".AppImage"}
-            new_files = current_files - previous_files
-            removed_files = previous_files - current_files
+        # Check service file existence and permissions
+        if SERVICE_FILE_PATH.exists():
+            perms = oct(SERVICE_FILE_PATH.stat().st_mode)[-3:]
+            logging.info(f"Service file exists with permissions {perms}")
+            with open(SERVICE_FILE_PATH, 'r') as f:
+                logging.info("Service file contents:")
+                logging.info(f.read())
+        else:
+            logging.error("Service file does not exist!")
 
-            # Handle new AppImages
-            for new_file in new_files:
-                create_desktop_file(new_file)
-                processed_files[new_file] = get_appimage_metadata(new_file)
+        # Check service status
+        service_status = subprocess.run(
+            ["systemctl", "--user", "status", SERVICE_NAME],
+            capture_output=True, text=True
+        )
+        logging.info("Service status output:")
+        logging.info(service_status.stdout)
+        if service_status.stderr:
+            logging.error("Service status errors:")
+            logging.error(service_status.stderr)
 
-            # Check for updates in existing files
-            for existing_file in current_files & previous_files:
-                desktop_file = DESKTOP_DIR / f"{existing_file.stem}.desktop"
-                if needs_update(existing_file, desktop_file):
-                    logging.info(f"Updating desktop entry for modified AppImage: {existing_file}")
-                    create_desktop_file(existing_file)
-                    processed_files[existing_file] = get_appimage_metadata(existing_file)
+        # Check journal logs
+        journal_logs = subprocess.run(
+            ["journalctl", "--user", "-u", SERVICE_NAME, "-n", "50", "--no-pager"],
+            capture_output=True, text=True
+        )
+        logging.info("Recent service logs:")
+        logging.info(journal_logs.stdout)
 
-            # Handle removed AppImages
-            if removed_files:
-                clean_desktop_files()
-                for removed_file in removed_files:
-                    processed_files.pop(removed_file, None)
-
-            previous_files = current_files
-            
-            # Verify script location periodically
-            current_script = Path(sys.argv[0]).resolve()
-            if current_script.parent != WATCH_DIR:
-                logging.warning("Script not in watch directory, attempting to fix...")
-                ensure_script_in_watch_dir()
-                
-        except Exception as e:
-            logging.error(f"Error in monitor loop: {e}")
-            
-        time.sleep(5)
+        return True
+    except Exception as e:
+        logging.error(f"Debug error: {str(e)}")
+        return False
 
 def install_user_service():
     """Install and enable the systemd user service."""
-    # Ensure script is in watch directory
-    script_path = ensure_script_in_watch_dir()
-    
-    service_content = f"""[Unit]
+    try:
+        # Ensure script is in watch directory
+        script_path = ensure_script_in_watch_dir()
+        
+        # Verify Python executable
+        python_path = shutil.which('python3')
+        if not python_path:
+            logging.error("Could not find python3 executable!")
+            return False
+
+        logging.info(f"Using Python executable: {python_path}")
+        logging.info(f"Script path: {script_path}")
+        
+        service_content = f"""[Unit]
 Description=AppImgMon - Monitor AppImage directory and generate .desktop files
 After=default.target
 
 [Service]
+Type=simple
 Environment="APPIMAGE_WATCH_DIR={WATCH_DIR}"
 Environment="DESKTOP_ENTRY_DIR={DESKTOP_DIR}"
 Environment="ICON_DIR={ICON_DIR}"
-ExecStart={script_path}
+Environment="PYTHONUNBUFFERED=1"
+ExecStart={python_path} {script_path}
 Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# Set to info level for normal operation
+LogLevelMax=info
 
 [Install]
 WantedBy=default.target
 """
 
-    # Ensure ~/.config/systemd/user exists
-    SERVICE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure ~/.config/systemd/user exists
+        SERVICE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    # Write service file
-    with open(SERVICE_FILE_PATH, "w") as f:
-        f.write(service_content)
-    logging.info(f"User service file created at {SERVICE_FILE_PATH}")
+        # Write service file
+        with open(SERVICE_FILE_PATH, "w") as f:
+            f.write(service_content)
+        os.chmod(SERVICE_FILE_PATH, 0o644)  # Set correct permissions
+        logging.info(f"Service file created at {SERVICE_FILE_PATH}")
 
-    # Enable and start the service
-    subprocess.run(["systemctl", "--user", "daemon-reload"])
-    subprocess.run(["systemctl", "--user", "enable", SERVICE_NAME])
-    subprocess.run(["systemctl", "--user", "start", SERVICE_NAME])
-    
-    logging.info(f"User service installed and started successfully!")
-    logging.info(f"The script is now monitoring: {WATCH_DIR}")
-    logging.info(f"Desktop entries will be created in: {DESKTOP_DIR}")
-    logging.info(f"Icons will be stored in: {ICON_DIR}")
+        try:
+            # Stop service if running
+            subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], 
+                         stderr=subprocess.DEVNULL)
+        except Exception as e:
+            logging.warning(f"Failed to stop existing service: {e}")
+
+        try:
+            # Enable and start the service
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+            logging.info("Daemon reloaded successfully")
+            
+            subprocess.run(["systemctl", "--user", "enable", SERVICE_NAME], check=True)
+            logging.info("Service enabled successfully")
+            
+            subprocess.run(["systemctl", "--user", "start", SERVICE_NAME], check=True)
+            logging.info("Service started successfully")
+
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Failed to configure service: {e}")
+            debug_systemd_service()
+            return False
+
+        # Wait a moment for service to start
+        time.sleep(2)
+
+        # Verify service status
+        result = subprocess.run(["systemctl", "--user", "is-active", SERVICE_NAME],
+                              capture_output=True, text=True)
+        
+        if result.stdout.strip() == "active":
+            logging.info("Service installed and running successfully!")
+            logging.info(f"Monitoring directory: {WATCH_DIR}")
+            logging.info(f"Desktop entries: {DESKTOP_DIR}")
+            logging.info(f"Icons: {ICON_DIR}")
+            return True
+        else:
+            logging.error("Service installation failed!")
+            debug_systemd_service()
+            return False
+
+    except Exception as e:
+        logging.error(f"Unexpected error during service installation: {e}")
+        debug_systemd_service()
+        return False
 
 if __name__ == "__main__":
     if "--install" in sys.argv:
-        install_user_service()
+        success = install_user_service()
+        if not success:
+            logging.error("Service installation failed. Check the logs above for details.")
+            sys.exit(1)
+    elif "--debug" in sys.argv:
+        debug_systemd_service()
     else:
         # If not in watch directory and not installing, exit
         current_script = Path(sys.argv[0]).resolve()
