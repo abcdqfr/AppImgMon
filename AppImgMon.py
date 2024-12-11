@@ -531,9 +531,14 @@ if __name__ == "__main__":
     elif "--debug" in sys.argv:
         debug_systemd_service()
     else:
-        # If not in watch directory and not installing, exit
+        # Check if script is in watch directory
         current_script = Path(sys.argv[0]).resolve()
-        if current_script.parent != WATCH_DIR and "--install" not in sys.argv:
-            logging.error(f"Please run this script with --install first")
-            sys.exit(1)
+        if current_script.parent != WATCH_DIR:
+            logging.warning(f"Script is not in the watch directory ({WATCH_DIR})")
+            logging.info("Installing service automatically...")
+            success = install_user_service()
+            if not success:
+                logging.error("Automatic service installation failed. Please run with --install flag.")
+                sys.exit(1)
+            sys.exit(0)
         monitor_appimages()
